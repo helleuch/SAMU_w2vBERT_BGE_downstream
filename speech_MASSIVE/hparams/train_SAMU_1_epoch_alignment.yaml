@@ -1,0 +1,185 @@
+# ################################
+# Model: w2vBERT (SAMU-BGE) + DNN + CTC + Softmax
+# Authors:
+# Haroun Elleuch 2025
+# ################################
+
+# Seed needs to be set at top of yaml, before objects with parameters are made.
+seed: 4242
+__set_seed: !apply:speechbrain.utils.seed_everything [!ref <seed>]
+
+output_folder: !ref results/SAMU_1_epoch_alignment/<seed>
+cer_file_test: !ref <output_folder>/cer_test.txt
+ctc_file_test: !ref <output_folder>/ctc_test.txt
+coer_file_test: !ref <output_folder>/coer_test.txt
+cver_file_test: !ref <output_folder>/cver_test.txt
+save_folder: !ref <output_folder>/save
+train_log: !ref <output_folder>/train_log.txt
+
+massive_data_root: /lustre/fsn1/projects/rech/slp/uxx18ce/amazon-massive-dataset-1.0/data
+speech_massive_root: /lustre/fsn1/projects/rech/slp/uxx18ce/speech_massive/Speech-MASSIVE
+
+wav2vec_url: /lustre/fsn1/projects/rech/slp/uxx18ce/models/w2v-bert-2.0
+
+# Data preparation parameters:
+do_preparation: false
+fewshot: true
+language: fr-FR
+manifests_dir: manifests
+
+data_prep_args:
+    lang: !ref <language>
+    massive_data_root: !ref <massive_data_root>
+    speech_massive_root: !ref <speech_massive_root>
+    output_dir: !ref <manifests_dir>
+
+csv_train: !ref <manifests_dir>/<language>_train.csv
+csv_train_115: !ref <manifests_dir>/<language>_train-115.csv
+csv_valid: !ref <manifests_dir>/<language>_dev.csv
+csv_test: !ref <manifests_dir>/<language>_test.csv
+
+# Data parameters:
+# With DDP batch_size is multiplied by N jobs.
+batch_size: 4
+test_batch_size: 2
+
+avoid_if_longer_than: 90.0
+avoid_if_smaller_than: 0.0
+num_workers: 4
+
+dataloader_options:
+    batch_size: !ref <batch_size>
+    num_workers: !ref <num_workers>
+    shuffle: True
+test_dataloader_options:
+    batch_size: !ref <test_batch_size>
+    num_workers: !ref <num_workers>
+
+# Feature parameters:
+sample_rate: 16000
+feats_dim: 1024
+
+####################### Training Parameters ####################################:
+number_of_epochs: 30
+lr: 1
+lr_wav2vec: 0.00001
+annealing_factor: 0.8
+annealing_factor_wav2vec: 0.9
+improvement_threshold: 0.0025
+improvement_threshold_wav2vec: 0.0025
+patient: 0
+patient_wav2vec: 0
+sorting: ascending
+
+####################### Model Parameters #######################################
+activation: !name:torch.nn.LeakyReLU
+dnn_blocks: 3
+dnn_neurons: 512
+
+# Wav2Vec parameters:
+freeze: False
+
+# Decoding parameters:
+blank_index: 0
+
+# Outputs:
+output_neurons: 101 #Vocab size of the CTC Text Encoder
+
+# ------ Functions and classes
+
+epoch_counter: !new:speechbrain.utils.epoch_loop.EpochCounter
+    limit: !ref <number_of_epochs>
+
+wav2vec2: !new:w2b_bert.HuggingFaceWav2Vec2
+    source: !ref <wav2vec_url>
+    output_norm: True
+    save_path: !ref <save_folder>/wav2vec2_checkpoint
+
+enc: !new:speechbrain.lobes.models.VanillaNN.VanillaNN
+    input_shape: [null, null, !ref <feats_dim>]
+    activation: !ref <activation>
+    dnn_blocks: !ref <dnn_blocks>
+    dnn_neurons: !ref <dnn_neurons>
+
+output_lin: !new:speechbrain.nnet.linear.Linear
+    input_size: !ref <dnn_neurons>
+    n_neurons: !ref <output_neurons>
+    bias: True
+
+log_softmax: !new:speechbrain.nnet.activations.Softmax
+    apply_log: True
+
+ctc_cost: !name:speechbrain.nnet.losses.ctc_loss
+    blank_index: !ref <blank_index>
+
+modules:
+    wav2vec2: !ref <wav2vec2>
+    enc: !ref <enc>
+    output_lin: !ref <output_lin>
+
+model: !new:torch.nn.ModuleList
+    - [!ref <enc>, !ref <output_lin>]
+
+model_wav2vec2: !new:torch.nn.ModuleList
+    - [!ref <wav2vec2>]
+
+opt_class: !name:torch.optim.Adadelta
+    lr: !ref <lr>
+    rho: 0.95
+    eps: 1.e-8
+
+opt_class_wav2vec: !name:torch.optim.Adam
+    lr: !ref <lr_wav2vec>
+
+lr_annealing: !new:speechbrain.nnet.schedulers.NewBobScheduler
+    initial_value: !ref <lr>
+    improvement_threshold: !ref <improvement_threshold>
+    annealing_factor: !ref <annealing_factor>
+    patient: !ref <patient>
+
+lr_annealing_wav2vec: !new:speechbrain.nnet.schedulers.NewBobScheduler
+    initial_value: !ref <lr_wav2vec>
+    improvement_threshold: !ref <improvement_threshold_wav2vec>
+    annealing_factor: !ref <annealing_factor_wav2vec>
+    patient: !ref <patient_wav2vec>
+
+label_encoder: !new:speechbrain.dataio.encoder.CTCTextEncoder
+
+checkpointer: !new:speechbrain.utils.checkpoints.Checkpointer
+    checkpoints_dir: !ref <save_folder>
+    recoverables:
+        model: !ref <model>
+        wav2vec2: !ref <wav2vec2>
+        lr_annealing: !ref <lr_annealing>
+        lr_annealing_wav2vec: !ref <lr_annealing_wav2vec>
+        counter: !ref <epoch_counter>
+        tokenizer: !ref <label_encoder>
+
+train_logger: !new:speechbrain.utils.train_logger.FileTrainLogger
+    save_file: !ref <train_log>
+
+ctc_computer: !name:speechbrain.utils.metric_stats.MetricStats
+    metric: !name:speechbrain.nnet.losses.ctc_loss
+        blank_index: !ref <blank_index>
+        reduction: batch
+
+cer_computer: !name:speechbrain.utils.metric_stats.ErrorRateStats
+
+coer_computer: !name:speechbrain.utils.metric_stats.ErrorRateStats
+    extract_concepts_values: True
+    keep_values: False
+    tag_in: '<'
+    tag_out: '>'
+
+cver_computer: !name:speechbrain.utils.metric_stats.ErrorRateStats
+    extract_concepts_values: True
+    keep_values: True
+    tag_in: '<'
+    tag_out: '>'
+
+pretrainer: !new:speechbrain.utils.parameter_transfer.Pretrainer
+  collect_in: !ref <output_folder>
+  loadables:
+    wav2vec2: !ref <wav2vec2>
+  paths:
+    wav2vec2: /lustre/fswork/projects/rech/fzq/uzm85fl/last_workspace/LV_speechbrain/speechbrain/recipes/SAMU/outputs_w2v_Bert_BGE_h100_batch2_lr_filter_run_evaluation/2422/save/CKPT+checkpoint_epoch1/wav2vec2.ckpt

@@ -9,8 +9,15 @@ Authors
  * Salima Mdhaffar 2024
 """
 
+from logging import INFO
+
 import torch
+from speechbrain.utils.logger import get_logger
 from torch import nn
+
+logger = get_logger(__name__)
+logger.setLevel(INFO)
+
 
 try:
     from transformers import (HubertConfig, HubertModel, Wav2Vec2BertConfig,
@@ -18,7 +25,7 @@ try:
                               Wav2Vec2FeatureExtractor, Wav2Vec2Model)
 
 except ImportError:
-    print(
+    logger.error(
         "Please install transformer from HuggingFace to use wav2vec2/Hubert !"
     )
 

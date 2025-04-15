@@ -11,14 +11,18 @@ Author: Haroun Elleuch, 2025
 """
 
 import json
+import re
+import wave
+from logging import INFO
 from pathlib import Path
 from typing import Dict, Optional
 
 import pandas as pd
-
 from speechbrain.utils.logger import get_logger
 
 logger = get_logger(__name__)
+logger.setLevel(INFO)
+
 
 
 def _load_massive_annotations(massive_jsonl_path: str) -> pd.DataFrame:
@@ -40,11 +44,67 @@ def _load_massive_annotations(massive_jsonl_path: str) -> pd.DataFrame:
     return df
 
 
+def _calculate_duration(wav_file: str) -> float:
+    """
+    Calculate the duration of a .wav file in seconds.
+    Computes the duration as: duration = num_frames / frame_rate.
+
+    Args:
+        wav_file (str): Path to the .wav audio file.
+
+    Returns:
+        float: Duration of the file in seconds, or 0.0 if an error occurs.
+    """
+    try:
+        with wave.open(wav_file, 'rb') as wav:
+            num_frames = wav.getnframes()  # Get the number of audio frames
+            frame_rate = wav.getframerate()  # Get the frame rate (samples per second)
+            duration = num_frames / float(frame_rate)  # Duration in seconds
+        return duration
+    except Exception as e:
+        logger.error(f"Error calculating duration for {wav_file}: {e}")
+        return 0.0
+
+
+def _sentence_to_char(utterance: str) -> str:
+
+    # Replace the necessary characters
+    utterance = utterance.replace("[", "<")
+    utterance = utterance.replace("]", ">")
+    utterance = utterance.replace(" : ", "> ")
+    utterance = utterance.replace(" ", "_")
+
+    # Function to handle the part between < and >
+    def handle_brackets(match):
+        return match.group(0).replace(" ", "")
+
+    # Use regex to find and replace the part between < and >
+    utterance = re.sub(r'<[^>]*>', handle_brackets, utterance)
+
+    # Convert each character to spaced-out format, except for the part between < and >
+    result = []
+    inside_brackets = False
+    for char in utterance:
+        if char == '<':
+            inside_brackets = True
+            result.append(char)
+        elif char == '>':
+            inside_brackets = False
+            result.append(char + " ")
+        elif inside_brackets:
+            result.append(char)
+        else:
+            result.append(f'{char} ')
+
+    spaced_out = ''.join(result).strip()
+
+    return spaced_out
+
+
 def _load_and_merge_split(
         csv_path: str,
         massive_df: pd.DataFrame,
         split_name: str,
-        wav_base_path: str,
 ) -> Optional[pd.DataFrame]:
     """
     Load a Speech-MASSIVE CSV and merge with MASSIVE annotations.
@@ -53,7 +113,6 @@ def _load_and_merge_split(
         csv_path: Path to the Speech-MASSIVE CSV.
         massive_df: DataFrame with MASSIVE annotations.
         split_name: Name of the data split (e.g., train, dev).
-        wav_base_path: Base path to the audio files.
 
     Returns:
         Merged DataFrame or None if file not found.
@@ -66,13 +125,18 @@ def _load_and_merge_split(
     spm_df = spm_df[spm_df["is_validated"] == True]
 
     spm_df["id"] = spm_df["massive_id"].astype(str)
+
+    wav_base_path = csv_path.replace(f"{split_name}.csv", f"audio/{split_name}")
     spm_df["wav"] = spm_df["file_name"].apply(lambda x: str(Path(wav_base_path) / x))
+
     spm_df["split"] = split_name
 
     merged_df = spm_df.merge(massive_df, on="id", how="left")
     merged_df["ID"] = merged_df["id"]
 
-    final_df = merged_df[["ID", "wav", "utt", "annot_utt", "intent", "split"]]
+    merged_df["char"] = merged_df["annot_utt"].apply(lambda x: _sentence_to_char(x))
+
+    final_df = merged_df[["ID", "wav", "utt", "annot_utt", "char", "intent", "split"]]
     return final_df
 
 
@@ -80,7 +144,6 @@ def build_per_split_manifests(
         lang: str,
         massive_jsonl_path: str,
         spm_csv_paths: Dict[str, str],
-        wav_base_path: str,
         output_dir: str = "."
 ) -> None:
     """
@@ -90,7 +153,6 @@ def build_per_split_manifests(
         lang: Language code (e.g., 'fr-FR').
         massive_jsonl_path: Path to MASSIVE JSONL annotation file.
         spm_csv_paths: Dict mapping split names to CSV paths.
-        wav_base_path: Directory containing WAV files.
         output_dir: Directory to save the generated manifest CSVs.
     """
     logger.info(f"Loading MASSIVE annotations for language: {lang}")
@@ -100,9 +162,10 @@ def build_per_split_manifests(
 
     for split_name, csv_path in spm_csv_paths.items():
         logger.info(f"Processing split: {split_name}")
-        split_df = _load_and_merge_split(csv_path, massive_df, split_name, wav_base_path)
+        split_df = _load_and_merge_split(csv_path, massive_df, split_name)
         if split_df is not None:
-            out_path = Path(output_dir) / f"manifest_{lang}_{split_name}.csv"
+            split_df["duration"] = split_df["wav"].apply(lambda x: _calculate_duration(x))
+            out_path = Path(output_dir) / f"{lang}_{split_name}.csv"
             split_df.to_csv(out_path, index=False)
             logger.info(f"✅ Saved: {out_path}")
         else:
@@ -126,8 +189,7 @@ def prepare_dataset(
     """
     massive_jsonl = Path(massive_data_root) / f"{lang}.jsonl"
     spm_train_dev = Path(speech_massive_root) / "train_dev" / lang
-    spm_test = Path(speech_massive_root) / "Speech-MASSIVE-test" / "test" / lang
-    wav_base_path = spm_train_dev / "audio"
+    spm_test = Path(speech_massive_root) / "test" / lang
 
     spm_csv_paths = {
         "train-115": spm_train_dev / "train-115.csv",
@@ -140,7 +202,6 @@ def prepare_dataset(
         lang=lang,
         massive_jsonl_path=str(massive_jsonl),
         spm_csv_paths={k: str(v) for k, v in spm_csv_paths.items()},
-        wav_base_path=str(wav_base_path),
         output_dir=output_dir,
     )
 
